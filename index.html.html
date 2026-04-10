@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hiperrealistyczna Autostrada - Menedżer Modeli</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #87CEEB; }
+        canvas { display: block; }
+        #ui { position: absolute; top: 20px; width: 100%; text-align: center; color: white; font-family: sans-serif; text-shadow: 2px 2px 4px black; z-index: 10;}
+        #loading { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: #111; color: white; display: flex; flex-direction: column; justify-content: center; align-items: center; font-size: 24px; font-family: sans-serif; z-index: 20; }
+        #loading-bar { width: 300px; height: 20px; border: 2px solid white; margin-top: 20px; border-radius: 10px; overflow: hidden; }
+        #loading-fill { width: 0%; height: 100%; background-color: #4CAF50; transition: width 0.2s; }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div id="loading-text">Ładowanie zasobów z serwera... 0%</div>
+        <div id="loading-bar"><div id="loading-fill"></div></div>
+        <div style="font-size: 14px; margin-top: 20px; color: #888;">(Upewnij się, że masz folder 'modele' na GitHubie z plikami .glb)</div>
+    </div>
+    <div id="ui">A / D - Skręt | W / S - Prędkość</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+    <script>
+        // 1. BAZA SCENY
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xa3d1ff);
+        scene.fog = new THREE.Fog(0xa3d1ff, 50, 300);
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // ŚWIATŁO
+        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(-60, 80, -60);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048; dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5; dirLight.shadow.camera.far = 300;
+        dirLight.shadow.camera.left = -100; dirLight.shadow.camera.right = 100;
+        dirLight.shadow.camera.top = 100; dirLight.shadow.camera.bottom = -100;
+        scene.add(dirLight);
+
+        // AUTOSTRADA (Baza)
+        const roadWidth = 24;
+        const road = new THREE.Mesh(new THREE.PlaneGeometry(roadWidth, 600), new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9 }));
+        road.rotation.x = -Math.PI / 2; road.receiveShadow = true; scene.add(road);
+        const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 600), new THREE.MeshStandardMaterial({ color: 0x2e4a22, roughness: 1.0 }));
+        ground.rotation.x = -Math.PI / 2; ground.position.y = -0.1; ground.receiveShadow = true; scene.add(ground);
+
+        // ==========================================
+        // SYSTEM: MENEDŻER MODELI (ASSET MANAGER)
+        // ==========================================
+        const modelRegistry = {
+            'auto': { url: 'modele/m5.glb', scale: 1, object: null },
+            'drzewo': { url: 'modele/drzewo.glb', scale: 1.5, object: null },
+            'krzak': { url: 'modele/krzak.glb', scale: 1, object: null },
+            'kamien': { url: 'modele/kamien.glb', scale: 2, object: null },
+            'barierka': { url: 'modele/barierka.glb', scale: 1, object: null }
+        };
+
+        const movingObjects = []; // Tu przechowujemy wszystko na autostradzie
+        let playerCar = null;
+        let gameReady = false;
+
+        const manager = new THREE.LoadingManager();
+        manager.onProgress = function (url, itemsLoaded, itemsTotal) {
+            const percent = Math.round((itemsLoaded / itemsTotal) * 100);
+            document.getElementById('loading-text').innerText = `Wczytywanie modeli... ${percent}%`;
+            document.getElementById('loading-fill').style.width = percent + '%';
+        };
+        
+        manager.onLoad = function () {
+            document.getElementById('loading').style.display = 'none';
+            budujSwiatPoZaladowaniu(); // Uruchom budowanie świata!
+            gameReady = true;
+        };
+
+        manager.onError = function (url) {
+            console.error('Nie znaleziono pliku na serwerze (GitHubie): ' + url);
+            document.getElementById('loading-text').innerText = `Błąd: Brak pliku ${url}`;
+            document.getElementById('loading-text').style.color = 'red';
+        };
+
+        const loader = new THREE.GLTFLoader(manager);
+
+        // Wczytywanie do rejestru
+        for (const nazwa in modelRegistry) {
+            loader.load(modelRegistry[nazwa].url, (gltf) => {
+                const model = gltf.scene;
+                model.scale.setScalar(modelRegistry[nazwa].scale);
+                model.traverse((child) => { if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; } });
+                modelRegistry[nazwa].object = model; // Zapisz gotowy model do pamięci
+            });
+        }
+
+        // ==========================================
+        // SYSTEM: DODAWANIE MODELI PO NAZWIE
+        // ==========================================
+        function dodajModel(nazwa, x, y, z) {
+            // Pobieramy model z naszego słownika
+            const wzor = modelRegistry[nazwa].object;
+            if (!wzor) return; // Jeśli model się nie załadował, omiń
+
+            const klon = wzor.clone(); // Klonujemy, żeby móc dodać ich nieskończenie wiele
+            klon.position.set(x, y, z);
+            scene.add(klon);
+            
+            // Jeśli to nie jest auto gracza, dodajemy do obiektów przesuwających się (bieżni)
+            if (nazwa !== 'auto') {
+                movingObjects.push(klon);
+            }
+            return klon;
+        }
+
+        function budujSwiatPoZaladowaniu() {
+            // 1. Dodajemy auto
+            playerCar = dodajModel('auto', 0, 0, 0);
+
+            // Jeśli model auta ma obróconą oś (jedzie tyłem/bokiem), odkomentuj to:
+            // playerCar.rotation.y = Math.PI; 
+
+            // 2. Dodajemy ciągłe barierki po obu stronach
+            for(let i=0; i<15; i++) {
+                dodajModel('barierka', -roadWidth/2, 0, -i*20);
+                dodajModel('barierka', roadWidth/2, 0, -i*20);
+            }
+
+            // 3. Rozrzucamy drzewa, krzaki i kamienie
+            for(let i=0; i<80; i++) {
+                const z = -Math.random() * 400; // Losowa odległość w przód
+                const strona = Math.random() > 0.5 ? 1 : -1;
+                const x = strona * ((roadWidth/2) + 5 + Math.random() * 40); // Za barierkami
+
+                // Losujemy co postawić
+                const los = Math.random();
+                if (los < 0.4) dodajModel('drzewo', x, 0, z);
+                else if (los < 0.7) dodajModel('krzak', x, 0, z);
+                else dodajModel('kamien', x, 0, z);
+            }
+
+            // 4. Dodajemy pasy na asfalcie (te dodajemy ręcznie, bez pliku)
+            for(let i=0; i<20; i++) {
+                const stripe = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 6), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+                stripe.rotation.x = -Math.PI/2; stripe.position.set(0, 0.05, -i*25);
+                scene.add(stripe); movingObjects.push(stripe);
+            }
+        }
+
+        // ==========================================
+        // STEROWANIE I FIZYKA
+        // ==========================================
+        const keys = { w: false, a: false, s: false, d: false, arrowup: false, arrowdown: false, arrowleft: false, arrowright: false };
+        let speed = 0; 
+        window.addEventListener('keydown', (e) => keys[e.key.toLowerCase()] = true);
+        window.addEventListener('keyup', (e) => keys[e.key.toLowerCase()] = false);
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (!gameReady || !playerCar) {
+                renderer.render(scene, camera);
+                return;
+            }
+
+            // Prędkość
+            if (keys.w || keys.arrowup) speed += 0.03; 
+            else if (keys.s || keys.arrowdown) speed -= 0.03; 
+            else speed *= 0.98;
+            speed = Math.max(0, Math.min(2.5, speed));
+            
+            // Skręt
+            let turn = 0; 
+            if (speed > 0.1) { 
+                if (keys.a || keys.arrowleft) turn = 1; 
+                if (keys.d || keys.arrowright) turn = -1; 
+            }
+            playerCar.position.x -= turn * 0.18;
+            playerCar.position.x = Math.max(-10, Math.min(10, playerCar.position.x)); // Blokada na barierkach
+            playerCar.rotation.z = turn * 0.05; // Przechył
+
+            // Bieżnia - przesuwanie otoczenia
+            movingObjects.forEach(obj => {
+                obj.position.z += speed;
+                // Kiedy obiekt minie kamerę, wrzucamy go na koniec trasy
+                if (obj.position.z > 20) {
+                    obj.position.z -= 400;
+                    
+                    // Jeśli to drzewo, kamień lub krzak (mają skomplikowaną strukturę w przeciwieństwie do płaskiego pasa), losujemy nową pozycję na bokach
+                    if (obj.type === 'Group' || (obj.geometry && obj.geometry.type !== 'PlaneGeometry')) {
+                         const strona = Math.random() > 0.5 ? 1 : -1;
+                         obj.position.x = strona * ((roadWidth/2) + 5 + Math.random() * 40);
+                    }
+                }
+            });
+
+            // Stabilna kamera z tyłu
+            camera.position.x = playerCar.position.x;
+            camera.position.y = 5;
+            camera.position.z = playerCar.position.z + 12;
+            camera.rotation.set(-0.15, 0, 0);
+
+            renderer.render(scene, camera);
+        }
+        animate();
+        window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+    </script>
+</body>
+</html>
